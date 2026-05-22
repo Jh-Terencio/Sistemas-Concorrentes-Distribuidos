@@ -1,274 +1,224 @@
-"""Coordenador multi-threaded para exclusao mutua centralizada.
+"""
+Coordenador da exclusão mútua centralizada distribuída.
 
-Threads:
-  1. accept_loop      - aceita novas conexoes TCP.
-  2. handle_client    - uma por cliente, le mensagens (REQUEST/RELEASE).
-  3. mutex_loop       - serializa o acesso a regiao critica (envia GRANT, espera RELEASE).
-  4. interface_loop   - terminal interativo (1=fila, 2=atendidos, 3=encerrar).
-
-Tambem mantem um LamportClock proprio, atualizado a cada evento de envio/recebimento.
+Como rodar:
+    python coordenador.py
 """
 
-from __future__ import annotations
-
-import argparse
+import logging
+import selectors
 import socket
-import sys
 import threading
-from collections import defaultdict, deque
-from datetime import datetime
-from typing import Optional
+from collections import deque
+from pathlib import Path
+from utils import (MSG_GRANT, MSG_RELEASE, MSG_REQUEST, parsear, receber_completo, serializar)
 
-from protocolo import (
-    F,
-    GRANT,
-    RELEASE,
-    REQUEST,
-    TIPO_NOME,
-    LamportClock,
-    decode,
-    encode,
-    recv_exato,
-)
+HOST = "127.0.0.1"
+PORT = 5000
 
+fila_pedidos: deque[int] = deque() # Fila de PIDs esperando a RC (ordem de chegada)
+clientes: dict[int, socket.socket] = {} # PID -> socket do cliente
+processo_atual: int | None = None # Processo que está na RC
+estado_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Estado global do coordenador
-# ---------------------------------------------------------------------------
+atendidos: dict[int, int] = {}     
 
-clock = LamportClock()
+executando = threading.Event() # Controla o loop das threads; set() para rodar, clear() para parar.
+executando.set()
 
-clientes: dict[int, socket.socket] = {}        # pid -> socket
-clientes_lock = threading.Lock()
+seletor = selectors.DefaultSelector() # Usado pela thread do algoritmo para esperar mensagens de QUALQUER cliente sem busy-wait. Optamos pelo selectors ao invés do busy-wait para evitar consumo excessivo de CPU e garantir que o coordenador seja responsivo mesmo com muitos clientes ou quando um cliente trava.
 
-fila: deque[int] = deque()                      # fila FIFO de pids aguardando GRANT
-fila_cond = threading.Condition()               # protege fila e sinaliza chegadas
+_acorda_r, _acorda_w = socket.socketpair()
 
-release_event = threading.Event()               # sinaliza chegada do RELEASE esperado
-release_pid_esperado: Optional[int] = None      # pid do qual aguardamos RELEASE
-release_lock = threading.Lock()                 # protege release_pid_esperado
+def configurar_log() -> None:
+    """Configura o logger para gravar em logs/coordenador.log com timestamp em milissegundos"""
+    Path("logs").mkdir(exist_ok=True)
+    handler = logging.FileHandler("logs/coordenador.log", mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter(fmt="%(asctime)s.%(msecs)03d | %(message)s", datefmt="%H:%M:%S"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
 
-atendidos: dict[int, int] = defaultdict(int)    # pid -> quantidade de GRANTs entregues
-atendidos_lock = threading.Lock()
+# Para mostrar o log no terminal
+def log(evento: str) -> None:
+    logging.info(evento)
+    print(f"[LOG] {evento}")
 
-log_lock = threading.Lock()
-log_file = None                                  # type: ignore[assignment]
+def enviar_grant(pid: int) -> None:
+    """Envia GRANT para o processo `pid`, marca-o como atual na RC e registra no log."""
+    global processo_atual
+    sock = clientes.get(pid)
+    if sock is None:
+        log(f"Tentativa de enviar GRANT para PID {pid}, mas socket não encontrado.")
+        return
+    sock.sendall(serializar(MSG_GRANT, pid))
+    processo_atual = pid
+    log(f"ENVIADO GRANT   -> PID {pid}")
 
-shutdown = threading.Event()
+# Thread 1: Aceitar conexões
+def thread_aceitar(servidor: socket.socket) -> None:
+    """Aceita conexões TCP"""
+    while executando.is_set():
+        
+        sock_cliente, addr = servidor.accept()
 
+        # Lê o primeiro REQUEST para descobrir o PID do cliente. (Handshake simples: o cliente tem que mandar um REQUEST logo ao conectar, e o PID vem daí. Poderia ser mais elaborado, mas é suficiente para este exercício.)
+        dados = receber_completo(sock_cliente)
+        
+        id_msg, pid = parsear(dados)
+        if id_msg != MSG_REQUEST:
+            log(f"Handshake inválido de {addr}: id={id_msg}")
+            sock_cliente.close()
+            continue
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+        with estado_lock: # estado_lock para proteger a estrutura de clientes e fila_pedidos, assim dois clientes não se atropelam ao conectar ao mesmo tempo.
+            clientes[pid] = sock_cliente
+            seletor.register(sock_cliente, selectors.EVENT_READ, data=pid) # Registra o socket do cliente no seletor para a thread do algoritmo ler mensagens dele. 
+            estava_vazia = (not fila_pedidos) and (processo_atual is None)
+            
+            fila_pedidos.append(pid)
+            
+            log(f"RECEBIDO REQUEST <- PID {pid} (conexão de {addr[0]}:{addr[1]})")
+            if estava_vazia:
+                proximo = fila_pedidos.popleft()
+                enviar_grant(proximo)
 
-def log_evento(direcao: str, tipo: int, pid: int, lamport_msg: int, lamport_coord: int) -> None:
-    """Escreve uma linha no log do coordenador.
+        _acorda_w.send(b"x")
 
-    Formato: <ts_fisico_ms>|<lamport_coord>|<direcao>|<tipo>|<pid>|<lamport_msg>
-    """
-    ts = datetime.now().isoformat(timespec="milliseconds")
-    linha = f"{ts}|{lamport_coord}|{direcao}|{TIPO_NOME[tipo]}|{pid}|{lamport_msg}\n"
-    with log_lock:
-        log_file.write(linha)
-        log_file.flush()
+# Thread 2: Algoritmo centralizado
+def thread_algoritmo() -> None:
+    seletor.register(_acorda_r, selectors.EVENT_READ, data="wakeup") # Registra o socket de wakeup para poder acordar o select quando for necessário
 
+    while executando.is_set():
+        eventos = seletor.select(timeout=0.5)
+        for chave, _ in eventos:
+            if chave.data == "wakeup":
+                try:
+                    _acorda_r.recv(1024)
+                except OSError:
+                    pass
+                continue
 
-# ---------------------------------------------------------------------------
-# Threads
-# ---------------------------------------------------------------------------
+            pid_origem = chave.data
+            sock = chave.fileobj
+            dados = receber_completo(sock)
+            if dados is None:
+                tratar_desconexao(pid_origem, sock)
+                continue
 
-def handle_client(sock: socket.socket, addr) -> None:
-    """Le mensagens de um cliente ate ele desconectar."""
-    pid_registrado: Optional[int] = None
-    try:
-        while not shutdown.is_set():
-            buf = recv_exato(sock, F)
-            if not buf:
-                break  # cliente fechou conexao
-            try:
-                msg_id, pid, lamport_msg = decode(buf)
-            except ValueError as e:
-                print(f"[coord] erro decodificando de {addr}: {e}", file=sys.stderr)
-                break
+            id_msg, pid = parsear(dados)
 
-            # Atualiza relogio logico do coordenador ao receber.
-            lc = clock.update(lamport_msg)
-            log_evento("RECV", msg_id, pid, lamport_msg, lc)
+            if id_msg == MSG_REQUEST:
+                tratar_request(pid)
+            elif id_msg == MSG_RELEASE:
+                tratar_release(pid)
+            else:
+                log(f"Mensagem desconhecida id={id_msg} de PID {pid}")
 
-            if pid_registrado is None:
-                pid_registrado = pid
-                with clientes_lock:
-                    clientes[pid] = sock
+def tratar_request(pid: int) -> None:
+    """REQUEST: Enfileira o pid. Se ninguém está na RC e a fila estava vazia, manda GRANT imediatamente."""
+    with estado_lock:
+        log(f"RECEBIDO REQUEST <- PID {pid}")
+        fila_pedidos.append(pid)
+        if processo_atual is None:
+            proximo = fila_pedidos.popleft()
+            enviar_grant(proximo)
 
-            if msg_id == REQUEST:
-                with fila_cond:
-                    fila.append(pid)
-                    fila_cond.notify_all()
-            elif msg_id == RELEASE:
-                with release_lock:
-                    esperado = release_pid_esperado
-                if esperado == pid:
-                    release_event.set()
-                else:
-                    print(
-                        f"[coord] RELEASE inesperado de pid={pid} (esperado={esperado})",
-                        file=sys.stderr,
-                    )
-            elif msg_id == GRANT:
-                # Coordenador nao deve receber GRANT.
-                print(f"[coord] GRANT recebido (inesperado) de pid={pid}", file=sys.stderr)
-    except OSError:
-        pass
-    finally:
+def tratar_release(pid: int) -> None:
+    """RELEASE: Contabiliza o atendimento e passa o GRANT para o próximo da fila."""
+    global processo_atual
+    with estado_lock:
+        log(f"RECEBIDO RELEASE <- PID {pid}")
+        atendidos[pid] = atendidos.get(pid, 0) + 1
+        processo_atual = None
+        if fila_pedidos:
+            proximo = fila_pedidos.popleft()
+            enviar_grant(proximo)
+
+def tratar_desconexao(pid: int, sock: socket.socket) -> None:
+    """Remove cliente caído das estruturas. Se ele estava na fila ou era o titular, libera o slot para não travar o sistema inteiro."""
+    global processo_atual
+    with estado_lock:
+        log(f"DESCONEXÃO    <- PID {pid}")
+        try:
+            seletor.unregister(sock)
+        except (KeyError, ValueError):
+            pass
         try:
             sock.close()
         except OSError:
             pass
-        if pid_registrado is not None:
-            with clientes_lock:
-                clientes.pop(pid_registrado, None)
+        clientes.pop(pid, None)
+
+        if pid in fila_pedidos:
+            fila_pedidos.remove(pid)
+
+        if processo_atual == pid:
+            processo_atual = None
+            if fila_pedidos:
+                proximo = fila_pedidos.popleft()
+                enviar_grant(proximo)
 
 
-def accept_loop(server_sock: socket.socket) -> None:
-    """Aceita novas conexoes e dispara uma thread receptora para cada cliente."""
-    while not shutdown.is_set():
+# Thread 3: Interface
+def thread_interface() -> None:
+    print("Interface do coordenador ativa.")
+    print("Comandos: fila | atendidos | sair")
+    while executando.is_set():
         try:
-            sock, addr = server_sock.accept()
-        except OSError:
+            cmd = input("> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            cmd = "sair"
+
+        if cmd == "fila":
+            with estado_lock:
+                print(f"  titular atual: {processo_atual}")
+                print(f"  fila de espera: {list(fila_pedidos)}")
+        elif cmd == "atendidos":
+            print(f"  atendimentos por PID: {dict(atendidos)}")
+        elif cmd == "sair":
+            print("Encerrando coordenador...")
+            executando.clear()
+            try:
+                _acorda_w.send(b"x")
+            except OSError:
+                pass
             break
-        t = threading.Thread(target=handle_client, args=(sock, addr), daemon=True)
-        t.start()
-
-
-def mutex_loop() -> None:
-    """Loop do algoritmo centralizado: GRANT -> espera RELEASE -> repete."""
-    global release_pid_esperado
-    while not shutdown.is_set():
-        # 1) aguarda alguem na fila
-        with fila_cond:
-            while not fila and not shutdown.is_set():
-                fila_cond.wait(timeout=0.5)
-            if shutdown.is_set():
-                return
-            pid = fila.popleft()
-
-        # 2) localiza o socket
-        with clientes_lock:
-            sock = clientes.get(pid)
-        if sock is None:
-            # cliente desconectou antes de receber GRANT; ignora e segue.
-            print(f"[coord] pid={pid} sem socket; pulando", file=sys.stderr)
+        elif cmd == "":
             continue
-
-        # 3) prepara espera por RELEASE deste pid
-        with release_lock:
-            release_pid_esperado = pid
-        release_event.clear()
-
-        # 4) envia GRANT
-        lc = clock.tick()
-        try:
-            sock.sendall(encode(GRANT, pid, lc))
-        except OSError as e:
-            print(f"[coord] erro enviando GRANT a pid={pid}: {e}", file=sys.stderr)
-            with release_lock:
-                release_pid_esperado = None
-            continue
-        log_evento("SEND", GRANT, pid, lc, lc)
-        with atendidos_lock:
-            atendidos[pid] += 1
-
-        # 5) aguarda RELEASE correspondente
-        while not shutdown.is_set():
-            if release_event.wait(timeout=0.5):
-                break
-        with release_lock:
-            release_pid_esperado = None
-
-
-def interface_loop() -> None:
-    """Terminal interativo do coordenador."""
-    ajuda = "[1] mostrar fila  [2] mostrar atendidos  [3] encerrar"
-    print(ajuda)
-    while not shutdown.is_set():
-        try:
-            cmd = input("> ").strip()
-        except EOFError:
-            return
-        if cmd == "1":
-            with fila_cond:
-                snapshot = list(fila)
-            print(f"fila: {snapshot}")
-        elif cmd == "2":
-            with atendidos_lock:
-                snapshot = dict(atendidos)
-            print(f"atendidos: {snapshot}")
-        elif cmd == "3":
-            print("[coord] encerrando...")
-            shutdown.set()
-            return
         else:
-            print(ajuda)
-
-
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+            print(f"  comando desconhecido: '{cmd}'")
 
 def main() -> None:
-    global log_file
+    configurar_log()
 
-    parser = argparse.ArgumentParser(description="Coordenador de exclusao mutua centralizada.")
-    parser.add_argument("--host", default="0.0.0.0", help="endereco de bind")
-    parser.add_argument("--porta", type=int, default=5000, help="porta TCP")
-    parser.add_argument("--log", default="coordenador.log", help="arquivo de log")
-    args = parser.parse_args()
+    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    servidor.bind((HOST, PORT))
+    servidor.listen()
+    print(f"Coordenador escutando em {HOST}:{PORT}")
+    log(f"Coordenador iniciado em {HOST}:{PORT}")
 
-    log_file = open(args.log, "w", encoding="utf-8", buffering=1)
-
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((args.host, args.porta))
-    server_sock.listen(128)
-    print(f"[coord] escutando em {args.host}:{args.porta}")
-
-    t_accept = threading.Thread(target=accept_loop, args=(server_sock,), daemon=True)
-    t_mutex = threading.Thread(target=mutex_loop, daemon=True)
-    t_ui = threading.Thread(target=interface_loop, daemon=True)
-    t_accept.start()
-    t_mutex.start()
-    t_ui.start()
+    t_aceitar = threading.Thread(target=thread_aceitar, args=(servidor,),
+                                 name="aceitar", daemon=True)
+    t_algoritmo = threading.Thread(target=thread_algoritmo,
+                                   name="algoritmo", daemon=True)
+    t_aceitar.start()
+    t_algoritmo.start()
 
     try:
-        # Espera shutdown via interface ou Ctrl+C.
-        while not shutdown.is_set():
-            shutdown.wait(timeout=0.5)
-    except KeyboardInterrupt:
-        shutdown.set()
-    finally:
+        thread_interface()
+    finally:    
+        with estado_lock:
+            for sock in list(clientes.values()):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
         try:
-            server_sock.close()
+            servidor.close()
         except OSError:
             pass
-        # Acorda o mutex_loop, se estiver aguardando na fila vazia.
-        with fila_cond:
-            fila_cond.notify_all()
-        # Fecha sockets de clientes.
-        with clientes_lock:
-            for s in list(clientes.values()):
-                try:
-                    s.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-                try:
-                    s.close()
-                except OSError:
-                    pass
-            clientes.clear()
-        if log_file is not None:
-            log_file.close()
-        print("[coord] encerrado.")
-
 
 if __name__ == "__main__":
     main()

@@ -1,168 +1,170 @@
-# Plano — Trabalho de Exclusão Mútua Centralizada (Sistemas Distribuídos)
+# Plano — Exclusão Mútua Centralizada Distribuída (Sistemas Distribuídos)
 
 ## Contexto
 
-Trabalho da disciplina de Sistemas Concorrentes Distribuídos: projetar e implementar o **algoritmo centralizado de exclusão mútua distribuída** em **Python**, usando **sockets TCP** (um socket por processo). Há um coordenador multi-threaded que serializa o acesso à região crítica, e `n` processos clientes que executam em loop `r` requisições, escrevendo em `resultado.txt` e dormindo `k` segundos dentro da seção crítica.
+Trabalho da disciplina de Sistemas Distribuídos: implementar o **algoritmo centralizado de exclusão mútua distribuída** em Python 3, usando apenas bibliotecas padrão (`socket`, `threading`, `selectors`, `queue`, `logging`, `time`, `datetime`, `multiprocessing`).
 
-Entregáveis exigidos pelo enunciado:
-- Programa funcional (coordenador + processos + launcher).
-- Log do coordenador com todas as mensagens enviadas/recebidas.
-- Arquivo `resultado.txt` com `n*r` linhas para validação de corretude.
-- Avaliação em diferentes cenários (variando n, k, r).
-- Relatório de até 6 páginas e apresentação de até 6 minutos.
-- Trabalho em trio.
+O sistema é composto por um **coordenador** (multi-threaded) que arbitra acesso a uma região crítica usando uma fila FIFO de pedidos, e por **n processos clientes** que repetidamente solicitam acesso, escrevem (PID, timestamp) em `resultado.txt`, dormem `k` segundos e liberam.
 
-Decisões já alinhadas:
-- **Linguagem:** Python
-- **Transporte:** TCP, um socket por processo (coordenador mantém dicionário `pid -> socket`)
-- **Inicialização:** launcher Python usando `argparse` para parametrizar `n`, `k`, `r`, host e porta
-- **Estudos de caso:** variar `n`, `k` e `r`
+Apresentação **ao vivo (6 min, em trio)** — então o código deve ser **simples de explicar**, com nomes em **português**, comentários focados no *porquê*, e divisão clara de responsabilidades. Existe um código de referência de turmas anteriores na pasta `Trabalho_SD_ExclusaoMutua/` que será usado **apenas como inspiração** (tem bugs sérios — ver seção "Lições do código antigo").
 
-**Requisitos extras solicitados pelo professor (fora do PDF):**
-- **Relógio lógico de Lamport** implementado em todos os processos e no coordenador, atualizado em cada evento de envio/recebimento de mensagem (regra: `L = max(L, L_recebido) + 1`). O timestamp lógico deve ser registrado no log do coordenador e usado para ordenar eventos.
-- **Sleep aleatório fora da região crítica:** cada processo dorme `random.uniform(3, 4)` segundos **antes** de enviar cada REQUEST, para dessincronizar os processos e evitar que cheguem todos juntos ao coordenador.
+## Decisões de design
 
-## Estrutura do projeto
+| Decisão | Escolha | Justificativa |
+|---|---|---|
+| Estrutura | Múltiplos arquivos em pasta nova `solucao/` | Permite explicar uma responsabilidade por vez na apresentação |
+| Idioma | Português nos identificadores e comentários | Combina com o enunciado e facilita defesa oral |
+| Threading do coordenador | 3 threads: aceitar + algoritmo (com `selectors.select`) + interface | Segue exatamente a sugestão do PDF; evita busy-wait (bug do código de referência) |
+| Transporte | TCP (`socket.SOCK_STREAM`) | Mais simples para garantir entrega ordenada e confiável; um socket por processo |
+| Framing | Mensagens de tamanho fixo `F = 16` bytes + leitura em laço até completar `F` | Resolve fragmentação de TCP; ainda atende o requisito de tamanho fixo |
+| Formato da mensagem | `"{id}|{pid}|<padding-zeros>"` ex: `"1|3|000000000000"` | Igual ao exemplo do PDF |
+| Parse | `split('|')` e tomar `parts[0]`/`parts[1]`, ignorando `parts[2]` (padding) | Evita o bug de `rstrip('0')` do código antigo (que quebra com PID ≥ 10) |
+| Fila | `collections.deque` protegida por `threading.Lock` | `Queue` esconderia detalhes que precisamos inspecionar (comando "fila") |
+| Lançamento dos processos | `multiprocessing.Process` no script `executar.py`, sequencial sem retardo | PDF exige inicialização sequencial e mesma máquina |
+| Parâmetros | CLI args: `n`, `r`, `k` (com defaults n=5, r=3, k=1) | Permite demonstrar diferentes cenários ao vivo |
+
+## Estrutura de arquivos
 
 ```
-Sistemas-Concorrentes-Distribuidos/
-├── plan.md                     # este plano
-├── coordenador.py              # processo coordenador multi-threaded
-├── processo.py                 # processo cliente
-├── launcher.py                 # dispara n processos sequencialmente via argparse
-├── protocolo.py                # constantes, encode/decode de mensagens de F bytes + LamportClock
-├── verificar.py                # valida resultado.txt e log do coordenador
-├── experimentos/
-│   ├── rodar_experimentos.py   # roda múltiplas combinações de n, k, r
-│   └── resultados/             # logs e resultado.txt de cada cenário
-├── relatorio/
-│   └── relatorio.md            # rascunho do relatório (até 6 páginas)
-└── README.md                   # instruções de execução
+solucao/
+  comum.py          # constantes (F, separador, IDs de msg) + serializar/parsear
+  coordenador.py    # 3 threads: aceitar / algoritmo / interface
+  processo.py       # função run_processo(pid, r, k): loop REQUEST→GRANT→CR→RELEASE
+  executar.py       # lança n processos com multiprocessing + valida no final
+  validar.py        # checagens de corretude (linhas, ordem cronológica, log)
+  README.md         # como rodar, exemplos, comandos da interface
+  logs/             # gerado em runtime: coordenador.log
+  resultado.txt     # gerado em runtime
 ```
 
-## Etapas de desenvolvimento
+Arquivos antigos em `Trabalho_SD_ExclusaoMutua/` ficam intocados para comparação.
 
-### Etapa 1 — Protocolo de mensagens (`protocolo.py`)
-- Definir constante `F` (tamanho fixo, ex.: `F = 24` bytes para acomodar o timestamp lógico) e separador `|`.
-- IDs de mensagem: `REQUEST=1`, `GRANT=2`, `RELEASE=3`.
-- **Formato (com Lamport):** `<msg_id>|<pid>|<lamport>|<padding até F bytes>` — o `lamport` é o relógio lógico do remetente no momento do envio.
-- Funções:
-  - `encode(msg_id, pid, lamport) -> bytes` — gera string de F bytes.
-  - `decode(buf) -> (msg_id, pid, lamport)` — separa pelos `|` e valida tamanho.
-- Como o TCP é stream, ler exatamente F bytes por mensagem (`recv` em loop até completar F).
+## Protocolo de mensagens (`comum.py`)
 
-### Etapa 1.b — Relógio lógico de Lamport
-- Classe `LamportClock` com atributo `value` e `Lock`:
-  - `tick() -> int`: incrementa e retorna o valor (uso em evento local / antes de enviar).
-  - `update(received: int) -> int`: `value = max(value, received) + 1` (uso ao receber mensagem).
-- **Coordenador** mantém um `LamportClock` próprio, atualizado a cada REQUEST/RELEASE recebido e antes de cada GRANT enviado.
-- **Processo cliente** mantém um `LamportClock` próprio, atualizado antes de enviar REQUEST/RELEASE e ao receber GRANT.
-- O log do coordenador inclui o timestamp lógico de Lamport além do timestamp físico (ms).
+```
+F = 16 bytes, separador = "|"
 
-### Etapa 2 — Coordenador (`coordenador.py`)
-Três threads, conforme sugerido no enunciado:
+MSG_REQUEST = "1"   # processo pede a região crítica
+MSG_GRANT   = "2"   # coordenador autoriza
+MSG_RELEASE = "3"   # processo libera
 
-1. **Thread de aceitação de conexões** (`accept_loop`)
-   - `socket.accept()` em loop; para cada novo cliente cria uma thread receptora dedicada e adiciona o socket ao dicionário `clientes[pid]`.
+Formato: "{id_msg}|{pid}|{padding até F bytes com '0'}"
+Exemplos com F=16:
+  REQUEST de PID 3   -> "1|3|000000000000"
+  GRANT   p/ PID 12  -> "2|12|00000000000"
+  RELEASE de PID 12  -> "3|12|00000000000"
+```
 
-2. **Thread receptora por cliente** (`handle_client`)
-   - Lê mensagens de F bytes do socket; faz `clock.update(msg.lamport)` em cada recebimento; ao receber REQUEST, enfileira `pid` na fila; ao receber RELEASE, sinaliza o algoritmo.
+Funções:
+- `serializar(id_msg: str, pid: int) -> bytes` — monta string e faz `ljust(F, "0").encode()`
+- `parsear(dados: bytes) -> tuple[str, int]` — `decode().split('|')` e retorna `(parts[0], int(parts[1]))`
+- `receber_completo(sock) -> bytes | None` — laço lendo até completar F bytes (resolve fragmentação TCP); retorna `None` em desconexão
 
-3. **Thread do algoritmo de exclusão mútua** (`mutex_loop`)
-   - Loop: aguarda fila não vazia → tira primeiro `pid` → `clock.tick()` e envia GRANT pelo socket dele → aguarda RELEASE daquele `pid` → repete.
-   - Mantém contador `atendidos[pid]`.
+## Coordenador (`coordenador.py`)
 
-4. **Thread de interface (terminal)** (`interface_loop`)
-   - `input()` bloqueante. Comandos:
-     - `1` → imprime fila atual.
-     - `2` → imprime quantas vezes cada processo foi atendido.
-     - `3` → encerra (sinaliza shutdown e fecha sockets).
+Estado compartilhado, protegido por `threading.Lock`:
+- `fila_pedidos: deque[int]` — PIDs na ordem de chegada
+- `clientes: dict[int, socket]` — pid → socket
+- `atendidos: dict[int, int]` — contagem de quantas vezes cada pid completou a CR
+- `processo_atual: int | None` — quem está na CR (None se ninguém)
+- `executando: threading.Event` — flag para encerramento limpo
 
-Sincronização:
-- `collections.deque` + `threading.Lock` + `threading.Condition` para coordenar "fila vazia" / "RELEASE recebido".
-- Opção recomendada vs. `queue.Queue`: precisamos inspecionar a fila para o comando `1` da interface.
+**Thread 1 — `thread_aceitar(servidor)`**
+- Loop: `accept()` → handshake (lê primeira msg para descobrir PID) → registra socket no `selectors` da thread de algoritmo via uma fila interna de "novos sockets" + `wakeup pipe` (truque para acordar o `select`).
+- *Mais simples na prática*: registra direto no selectors sob o lock e dispara um byte no pipe de wakeup para garantir que o `select` reavalie.
 
-Log:
-- Função `log(direcao, tipo_msg, pid, lamport)` grava em `coordenador.log` com timestamp físico em milissegundos (`datetime.now().isoformat(timespec='milliseconds')`) **e** o relógio de Lamport do coordenador no momento do evento.
-- Formato sugerido: `<timestamp_fisico>|<lamport_coord>|<direcao>|<tipo>|<pid>|<lamport_msg>`.
-- Lock dedicado para escrita no log.
+**Thread 2 — `thread_algoritmo()`**
+- `sel = selectors.DefaultSelector()`
+- Loop principal:
+  1. `eventos = sel.select(timeout=0.5)` — espera I/O ou timeout (para checar `executando`)
+  2. Para cada socket pronto: `receber_completo()` → `parsear()` → registra no log
+     - Se **REQUEST**: anexa pid na `fila_pedidos`. Se a fila estava vazia E `processo_atual is None`, envia GRANT imediato e marca titular.
+     - Se **RELEASE**: confere que o pid é o titular (invariante), zera titular, incrementa `atendidos[pid]`, e se a fila não está vazia, popleft o próximo e envia GRANT a ele.
+  3. Trata desconexão: remove do `clientes` e do `selectors`.
+- **Sem busy-wait**: `select` bloqueia até ter trabalho — corrige o bug do código de referência.
 
-### Etapa 3 — Processo cliente (`processo.py`)
-- Args: `--pid`, `--host`, `--porta`, `--k`, `--r`.
-- Mantém instância local de `LamportClock`.
-- Conecta TCP ao coordenador.
-- Loop `r` vezes:
-  1. **Sleep aleatório fora da RC:** `time.sleep(random.uniform(3, 4))` — dessincroniza requisições.
-  2. `clock.tick()` e envia REQUEST com `lamport` atual.
-  3. Aguarda GRANT (bloqueante; lê F bytes); ao receber, `clock.update(grant.lamport)`.
-  4. Abre `resultado.txt` em modo append e escreve `<pid>|<timestamp_físico_ms>|<lamport>\n`, fecha.
-  5. `time.sleep(k)`.
-  6. `clock.tick()` e envia RELEASE com `lamport` atual.
-- Fecha socket e termina.
+**Thread 3 — `thread_interface()`** (roda na main thread)
+- Loop `input()` com comandos:
+  - `fila` → imprime `list(fila_pedidos)` e `processo_atual`
+  - `atendidos` → imprime `dict(atendidos)`
+  - `sair` → seta `executando.clear()`, fecha sockets, encerra
 
-### Etapa 4 — Launcher (`launcher.py`)
-- `argparse` com flags `--n`, `--k`, `--r`, `--host`, `--porta`.
-- Loop sequencial (sem retardo) que invoca `subprocess.Popen(["python", "processo.py", "--pid", str(i), ...])` para `i` em `range(n)`.
-- Espera todos terminarem (`proc.wait()`) e imprime resumo.
-- **Pré-condição:** coordenador já deve estar rodando (documentado no README).
+**Logging** (`logging` para `logs/coordenador.log`):
+- Formato: `%(asctime)s.%(msecs)03d | %(message)s` com `datefmt="%H:%M:%S"`
+- Cada mensagem registra: `RECEBIDO REQUEST de PID X`, `ENVIADO GRANT para PID X`, `RECEBIDO RELEASE de PID X`, conexão/desconexão.
 
-### Etapa 5 — Verificação de corretude (`verificar.py`)
-- Conferir que `resultado.txt` tem exatamente `n*r` linhas.
-- Conferir que os timestamps físicos são monotonicamente crescentes.
-- Conferir que **os timestamps de Lamport também são monotonicamente crescentes** (consistência causal).
-- Conferir que cada `pid` aparece exatamente `r` vezes.
-- Conferir no `coordenador.log` que: (a) cada GRANT é seguido de RELEASE do mesmo `pid` antes do próximo GRANT; (b) a ordem dos `pid` em REQUEST atendidos é igual à ordem de RELEASE.
+## Processo (`processo.py`)
 
-### Etapa 6 — Estudos de caso (`experimentos/rodar_experimentos.py`)
-Matriz de experimentos (combinações sugeridas, ajustáveis). Lembrar que cada iteração agora soma `random.uniform(3, 4)` segundos fora da RC:
-- **Variar n:** `n ∈ {2, 4, 8, 16}` com `k=0.1`, `r=5` fixos.
-- **Variar k:** `k ∈ {0, 0.05, 0.2, 0.5}` com `n=4`, `r=5` fixos.
-- **Variar r:** `r ∈ {3, 5, 10}` com `n=4`, `k=0.1` fixos.
+Função `run_processo(pid, r, k)`:
+1. Cria socket TCP, conecta em `127.0.0.1:5000`.
+2. Envia mensagem inicial (usa REQUEST de identificação — o handshake é o **primeiro REQUEST do laço**, não inventa msg "0" como o código antigo).
+   - *Decisão*: o coordenador identifica o pid pelo **conteúdo da primeira mensagem recebida** desse socket. Sem msg extra fora do protocolo.
+3. Loop `r` vezes:
+   - Envia REQUEST (na primeira iteração, isso também serve de handshake)
+   - `receber_completo()` até chegar um GRANT para esse pid
+   - **Região crítica**: abre `resultado.txt` em modo `"a"`, escreve `f"PID {pid} | {datetime.now().strftime('%H:%M:%S.%f')}\n"`, fecha
+   - `time.sleep(k)`
+   - Envia RELEASE
+4. Fecha socket.
 
-Para cada cenário:
-1. Limpar `resultado.txt` e `coordenador.log`.
-2. Subir coordenador, rodar launcher, esperar término.
-3. Coletar métricas: tempo total, throughput (RC/seg), tamanho médio da fila, justiça (variância de `atendidos[pid]`), drift do relógio de Lamport vs. relógio físico.
-4. Mover artefatos para `experimentos/resultados/<cenario>/`.
+## Lançador e validação (`executar.py` + `validar.py`)
 
-### Etapa 7 — Relatório e apresentação
-- **Relatório (até 6 páginas):** introdução, decisões de projeto (protocolo F bytes, TCP vs UDP, escolha de threads, sincronização com `Condition`, Lamport, sleep aleatório), arquitetura (diagrama), implementação resumida, estudos de caso (tabelas/gráficos), corretude, conclusão.
-- **Apresentação (até 6 min):** problema, arquitetura, demo curta (screenshot do log), 1 slide por estudo de caso, conclusão.
-- Trio: dividir entre os 3 membros (ex.: coordenador / processo+launcher / experimentos+relatório).
+`executar.py`:
+- CLI: `python executar.py --n 5 --r 3 --k 1`
+- Limpa `resultado.txt`.
+- Avisa o usuário que o coordenador precisa estar rodando em outro terminal (não inicia coordenador automaticamente — facilita ver os dois logs lado a lado na apresentação).
+- Cria `n` `multiprocessing.Process` chamando `run_processo`, dá `.start()` em todos sem retardo, depois `.join()`.
+- No final, chama `validar.validar_resultado(n, r)` e `validar.validar_log()`.
 
-## Arquivos críticos a serem criados
-- `protocolo.py`
-- `coordenador.py`
-- `processo.py`
-- `launcher.py`
-- `verificar.py`
-- `experimentos/rodar_experimentos.py`
-- `README.md`
+`validar.py`:
+- `validar_resultado(n, r)`: verifica nº de linhas = `n*r`, ordem cronológica, e `r` execuções por pid.
+- `validar_log()`: lê `logs/coordenador.log` e verifica invariantes:
+  - Todo GRANT é seguido (eventualmente) por um RELEASE do mesmo PID antes de outro GRANT.
+  - A ordem de RELEASE dos pids casa com a ordem de REQUEST aceita (FIFO).
 
-## Bibliotecas Python (stdlib, sem dependências externas)
-- `socket` — comunicação TCP.
-- `threading` (`Thread`, `Lock`, `Condition`) — multi-threading e proteção do `LamportClock`.
-- `collections.deque` — fila de pedidos com inspeção segura.
-- `argparse` — CLI do launcher e dos processos.
-- `subprocess.Popen` — iniciar os n processos sequencialmente.
-- `time` / `datetime` — timestamps com milissegundos.
-- `random` — sleep aleatório `random.uniform(3, 4)` fora da região crítica.
+## Lições do código antigo (o que NÃO repetir)
+
+1. **Não usar `rstrip("0")` na string inteira** — quebra PIDs com zeros (10, 20, 100…). Solução: split primeiro, ignora padding.
+2. **Não fazer busy-wait com `setblocking(False)` + `recv` em loop** — usa `selectors.select` com timeout.
+3. **Não inventar msg_id "0" fora do protocolo** — o primeiro REQUEST já identifica o pid.
+4. **Não chamar `recv(F)` confiando que vem F bytes** — fazer laço de leitura até completar F.
+5. **Encerramento limpo**: usar `threading.Event` em vez de daemon threads abandonadas.
+
+## Como executar (irá no README.md)
+
+```powershell
+# Terminal 1 — coordenador
+python solucao/coordenador.py
+
+# Terminal 2 — processos
+python solucao/executar.py --n 5 --r 3 --k 1
+
+# Comandos no terminal do coordenador (durante execução):
+#   fila        -> mostra a fila atual de pedidos + titular
+#   atendidos   -> mostra quantas vezes cada PID completou a CR
+#   sair        -> encerra o coordenador
+```
 
 ## Verificação end-to-end
 
-1. **Smoke test (n=2, k=0.1, r=3):**
-   ```
-   # Terminal 1
-   python coordenador.py --porta 5000
-   # Terminal 2
-   python launcher.py --n 2 --k 0.1 --r 3 --host 127.0.0.1 --porta 5000
-   ```
-   Esperado: `resultado.txt` com 6 linhas; `coordenador.log` mostrando 6 REQUEST, 6 GRANT, 6 RELEASE intercalados, com timestamps de Lamport monotonicamente crescentes. Devido ao sleep aleatório de 3–4s fora da RC, a execução total deve ficar próxima de `r * 3.5s ≈ 10–12s`.
+1. **Cenário base**: `n=5, r=3, k=1` — esperado `resultado.txt` com 15 linhas, ordem cronológica, validação automática deve passar.
+2. **Cenário com contenção**: `n=10, r=5, k=0.1` — testa a fila e a robustez do parse com PID=10.
+3. **Cenário leve**: `n=2, r=2, k=2` — bom para demonstrar passo-a-passo na apresentação.
+4. **Comandos da interface**: durante o cenário com contenção, executar `fila` no terminal do coordenador várias vezes para mostrar a evolução.
+5. **Inspecionar log**: abrir `logs/coordenador.log` e mostrar a sequência REQUEST/GRANT/RELEASE intercalada.
 
-2. **Comandos de interface do coordenador:** durante a execução, digitar `1`, `2` e ao final `3` no terminal do coordenador.
+## Possíveis perguntas do professor (para preparar a defesa)
 
-3. **Script de verificação:** `python verificar.py --resultado resultado.txt --log coordenador.log --n 2 --r 3` deve reportar "OK".
-
-4. **Carga moderada (n=8, k=0.05, r=10):** confirmar que não há deadlock, que `resultado.txt` tem 80 linhas e timestamps monotônicos.
-
-5. **Rodar matriz completa:** `python experimentos/rodar_experimentos.py` e inspecionar `experimentos/resultados/`.
+| Pergunta | Como responder |
+|---|---|
+| "Por que centralizado é simples mas não escala?" | Ponto único de falha + gargalo de mensagens (3 msgs por entrada na CR, todas passam pelo coordenador). Comparar com Ricart-Agrawala (2(n-1) msgs) e token ring. |
+| "Onde está a região crítica protegida no seu código?" | Entre o recebimento do GRANT e o envio do RELEASE no `processo.py` — o `open/write/close` em `resultado.txt`. |
+| "Como você garante FIFO?" | `deque` no coordenador: REQUEST faz `append`, RELEASE faz `popleft`. A entrega ordenada do TCP garante que a ordem de chegada no socket reflita a ordem de envio de cada processo. |
+| "Por que precisa do lock se a fila já é acessada por uma thread só?" | A interface (`fila`/`atendidos`) lê de outra thread — sem lock haveria leitura inconsistente. |
+| "O que acontece se um processo cair segurando o GRANT?" | Bug conhecido do centralizado: o coordenador trava na CR. Mitigação possível (não implementada): timeout no GRANT ou detecção de desconexão durante a CR liberando automaticamente. |
+| "Por que mensagens de tamanho fixo?" | Simplifica o framing: o coordenador sabe exatamente quantos bytes ler. Em TCP, sem isso, precisaríamos de delimitador ou prefixo de tamanho. |
+| "Por que `selectors` em vez de uma thread por cliente?" | A) Atende a sugestão do PDF de UMA thread de algoritmo. B) Evita custo de criar n threads. C) Centraliza a lógica num único laço — mais fácil de raciocinar e logar. |
+| "O log mostra GRANT sempre intercalado com RELEASE?" | Sim — invariante do algoritmo: só há um titular por vez. O script `validar.py` checa isso automaticamente. |
+| "Por que TCP e não UDP?" | TCP garante entrega ordenada e confiável → não preciso me preocupar com perda/reordenação. UDP exigiria retransmissão e sequence numbers. O PDF permite ambos. |
+| "O que é o `selectors.select` exatamente?" | Wrapper sobre `select`/`epoll`/`kqueue` do SO: bloqueia até que algum dos sockets registrados tenha dados, sem CPU ativa. |
+| "Como funcionaria com processos em máquinas diferentes?" | Trocar `127.0.0.1` pelo IP da máquina do coordenador e abrir a porta no firewall. O algoritmo não muda. |
