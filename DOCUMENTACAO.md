@@ -103,15 +103,15 @@ graph TB
     ARQ[("resultado.txt")]
     LOG[("logs/coordenador.log")]
 
-    P1 & P2 & Pn -. 1. conexão TCP .-> TA
-    P1 & P2 & Pn == 2. REQUEST / RELEASE ==> TAL
-    TAL == 3. GRANT ==> P1 & P2 & Pn
-    P1 & P2 & Pn -- 4. escrita na RC --> ARQ
+    P1 & P2 & Pn -.->|"1. conexão TCP"| TA
+    P1 & P2 & Pn ==>|"2. REQUEST / RELEASE"| TAL
+    TAL ==>|"3. GRANT"| P1 & P2 & Pn
+    P1 & P2 & Pn -->|"4. escrita na RC"| ARQ
 
     TA --> Q
     TAL --> Q
     TI --> Q
-    Q -.protegida por.- LOCK
+    Q -.->|"protegida por"| LOCK
     TA --> CL
     TAL --> LOG
 ```
@@ -244,7 +244,7 @@ graph LR
     T1 -->|escreve| EC
     T2 -->|lê e escreve| EC
     T3 -->|lê| EC
-    EC -.todo acesso protegido por.- L{{estado_lock}}
+    EC -.->|"todo acesso protegido por"| L{{estado_lock}}
 ```
 
 | Thread | Função em `coordenador.py` | O que faz | Onde "dorme" |
