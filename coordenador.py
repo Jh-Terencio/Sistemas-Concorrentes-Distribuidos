@@ -9,6 +9,7 @@ import logging
 import selectors
 import socket
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from utils import (MSG_GRANT, MSG_RELEASE, MSG_REQUEST, parsear, receber_completo, serializar)
@@ -16,9 +17,8 @@ from utils import (MSG_GRANT, MSG_RELEASE, MSG_REQUEST, parsear, receber_complet
 HOST = "127.0.0.1"
 PORT = 5000
 
-fila_pedidos: deque[int] = deque() # Fila de PIDs esperando a RC (ordem de chegada)
+fila_pedidos: deque[int] = deque() # Fila Q do algoritmo: a cabeça (índice 0) é o titular da RC; os demais aguardam, em ordem de chegada.
 clientes: dict[int, socket.socket] = {} # PID -> socket do cliente
-processo_atual: int | None = None # Processo que está na RC
 estado_lock = threading.Lock()
 
 atendidos: dict[int, int] = {}     
@@ -27,8 +27,6 @@ executando = threading.Event() # Controla o loop das threads; set() para rodar, 
 executando.set()
 
 seletor = selectors.DefaultSelector() # Usado pela thread do algoritmo para esperar mensagens de QUALQUER cliente sem busy-wait. Optamos pelo selectors ao invés do busy-wait para evitar consumo excessivo de CPU e garantir que o coordenador seja responsivo mesmo com muitos clientes ou quando um cliente trava.
-
-_acorda_r, _acorda_w = socket.socketpair()
 
 def configurar_log() -> None:
     """Configura o logger para gravar em logs/coordenador.log com timestamp em milissegundos"""
@@ -45,14 +43,12 @@ def log(evento: str) -> None:
     print(f"[LOG] {evento}")
 
 def enviar_grant(pid: int) -> None:
-    """Envia GRANT para o processo `pid`, marca-o como atual na RC e registra no log."""
-    global processo_atual
+    """Envia GRANT para o processo `pid` e registra no log. O titular da RC é sempre fila_pedidos[0]."""
     sock = clientes.get(pid)
     if sock is None:
         log(f"Tentativa de enviar GRANT para PID {pid}, mas socket não encontrado.")
         return
     sock.sendall(serializar(MSG_GRANT, pid))
-    processo_atual = pid
     log(f"ENVIADO GRANT   -> PID {pid}")
 
 # Thread 1: Aceitar conexões
@@ -73,32 +69,20 @@ def thread_aceitar(servidor: socket.socket) -> None:
 
         with estado_lock: # estado_lock para proteger a estrutura de clientes e fila_pedidos, assim dois clientes não se atropelam ao conectar ao mesmo tempo.
             clientes[pid] = sock_cliente
-            seletor.register(sock_cliente, selectors.EVENT_READ, data=pid) # Registra o socket do cliente no seletor para a thread do algoritmo ler mensagens dele. 
-            estava_vazia = (not fila_pedidos) and (processo_atual is None)
-            
-            fila_pedidos.append(pid)
-            
+            seletor.register(sock_cliente, selectors.EVENT_READ, data=pid) # Registra o socket do cliente no seletor para a thread do algoritmo ler mensagens dele.
             log(f"RECEBIDO REQUEST <- PID {pid} (conexão de {addr[0]}:{addr[1]})")
-            if estava_vazia:
-                proximo = fila_pedidos.popleft()
-                enviar_grant(proximo)
-
-        _acorda_w.send(b"x")
+            if not fila_pedidos:        # Q vazia: este PID vira o titular e já recebe o GRANT.
+                enviar_grant(pid)
+            fila_pedidos.append(pid)    # Entra na fila (na cabeça, se estava vazia).
 
 # Thread 2: Algoritmo centralizado
 def thread_algoritmo() -> None:
-    seletor.register(_acorda_r, selectors.EVENT_READ, data="wakeup") # Registra o socket de wakeup para poder acordar o select quando for necessário
-
     while executando.is_set():
+        if not seletor.get_map():   # Sem sockets registrados, select() daria erro no Windows; espera chegar algum cliente.
+            time.sleep(0.5)
+            continue
         eventos = seletor.select(timeout=0.5)
         for chave, _ in eventos:
-            if chave.data == "wakeup":
-                try:
-                    _acorda_r.recv(1024)
-                except OSError:
-                    pass
-                continue
-
             pid_origem = chave.data
             sock = chave.fileobj
             dados = receber_completo(sock)
@@ -116,28 +100,25 @@ def thread_algoritmo() -> None:
                 log(f"Mensagem desconhecida id={id_msg} de PID {pid}")
 
 def tratar_request(pid: int) -> None:
-    """REQUEST: Enfileira o pid. Se ninguém está na RC e a fila estava vazia, manda GRANT imediatamente."""
+    """REQUEST: se a fila Q estava vazia, o pid vira titular e recebe GRANT; em seguida entra na fila."""
     with estado_lock:
         log(f"RECEBIDO REQUEST <- PID {pid}")
+        if not fila_pedidos:
+            enviar_grant(pid)
         fila_pedidos.append(pid)
-        if processo_atual is None:
-            proximo = fila_pedidos.popleft()
-            enviar_grant(proximo)
 
 def tratar_release(pid: int) -> None:
-    """RELEASE: Contabiliza o atendimento e passa o GRANT para o próximo da fila."""
-    global processo_atual
+    """RELEASE: remove o titular (cabeça da fila Q) e passa o GRANT para o próximo, se houver."""
     with estado_lock:
         log(f"RECEBIDO RELEASE <- PID {pid}")
         atendidos[pid] = atendidos.get(pid, 0) + 1
-        processo_atual = None
         if fila_pedidos:
-            proximo = fila_pedidos.popleft()
-            enviar_grant(proximo)
+            fila_pedidos.popleft()          # Remove o titular que acabou de liberar (Q.remove()).
+        if fila_pedidos:
+            enviar_grant(fila_pedidos[0])   # O novo titular é a nova cabeça da fila (Q.head()).
 
 def tratar_desconexao(pid: int, sock: socket.socket) -> None:
-    """Remove cliente caído das estruturas. Se ele estava na fila ou era o titular, libera o slot para não travar o sistema inteiro."""
-    global processo_atual
+    """Remove cliente caído das estruturas. Se ele era o titular (cabeça da fila), passa o GRANT adiante para não travar o sistema."""
     with estado_lock:
         log(f"DESCONEXÃO    <- PID {pid}")
         try:
@@ -150,14 +131,12 @@ def tratar_desconexao(pid: int, sock: socket.socket) -> None:
             pass
         clientes.pop(pid, None)
 
+        era_titular = bool(fila_pedidos) and fila_pedidos[0] == pid
         if pid in fila_pedidos:
             fila_pedidos.remove(pid)
 
-        if processo_atual == pid:
-            processo_atual = None
-            if fila_pedidos:
-                proximo = fila_pedidos.popleft()
-                enviar_grant(proximo)
+        if era_titular and fila_pedidos:
+            enviar_grant(fila_pedidos[0])
 
 
 # Thread 3: Interface
@@ -172,17 +151,14 @@ def thread_interface() -> None:
 
         if cmd == "fila":
             with estado_lock:
-                print(f"  titular atual: {processo_atual}")
-                print(f"  fila de espera: {list(fila_pedidos)}")
+                titular = fila_pedidos[0] if fila_pedidos else None
+                print(f"  titular atual: {titular}")
+                print(f"  fila de espera: {list(fila_pedidos)[1:]}")
         elif cmd == "atendidos":
             print(f"  atendimentos por PID: {dict(atendidos)}")
         elif cmd == "sair":
             print("Encerrando coordenador...")
             executando.clear()
-            try:
-                _acorda_w.send(b"x")
-            except OSError:
-                pass
             break
         elif cmd == "":
             continue
