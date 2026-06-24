@@ -11,7 +11,6 @@ from validar import validar_log, validar_resultado
 ARQUIVO_RESULTADO = "resultado.txt"
 
 def run_experimento(n: int, r: int, k: float) -> None:
-    # Zerando o arquivo de resultado para o experimento atual
     Path(ARQUIVO_RESULTADO).write_text("", encoding="utf-8")
 
     print(f"=== Experimento: n={n} processos, r={r} repetições, k={k}s ===")
