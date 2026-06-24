@@ -58,7 +58,7 @@ def thread_aceitar(servidor: socket.socket) -> None:
         
         sock_cliente, addr = servidor.accept()
 
-        # Lê o primeiro REQUEST para descobrir o PID do cliente. (Handshake simples: o cliente tem que mandar um REQUEST logo ao conectar, e o PID vem daí. Poderia ser mais elaborado, mas é suficiente para este exercício.)
+        # Lê o primeiro REQUEST para descobrir o PID do cliente (Handshake)
         dados = receber_completo(sock_cliente)
         
         id_msg, pid = parsear(dados)
@@ -73,12 +73,12 @@ def thread_aceitar(servidor: socket.socket) -> None:
             log(f"RECEBIDO REQUEST <- PID {pid} (conexão de {addr[0]}:{addr[1]})")
             if not fila_pedidos:        # Q vazia: este PID vira o titular e já recebe o GRANT.
                 enviar_grant(pid)
-            fila_pedidos.append(pid)    # Entra na fila (na cabeça, se estava vazia).
+            fila_pedidos.append(pid)    # Entra na fila.
 
 # Thread 2: Algoritmo centralizado
 def thread_algoritmo() -> None:
     while executando.is_set():
-        if not seletor.get_map():   # Sem sockets registrados, select() daria erro no Windows; espera chegar algum cliente.
+        if not seletor.get_map():
             time.sleep(0.5)
             continue
         eventos = seletor.select(timeout=0.5)
