@@ -1,7 +1,3 @@
-"""
-Utils contendo funções auxiliares para coordenador e processo, como serialização e parsing de mensagens, etc
-"""
-
 F = 16     # Tamanho fixo (em bytes) de toda mensagem
 SEP = "|"  # Separador entre campos
 
@@ -22,7 +18,7 @@ def parsear(dados: bytes) -> tuple[str, int]:
     return partes[0], int(partes[1])
 
 def receber_completo(sock) -> bytes | None:
-    """Essa função garante que recebemos exatamente F bytes, mesmo que o recv retorne menos. Retorna None se a conexão for fechada."""
+    """Essa função garante que recebemos exatamente F bytes"""
     buffer = b""
     while len(buffer) < F:
         try:
